@@ -1,0 +1,6 @@
+Pillow
+pytesseract
+pyzbar
+pandas
+xlsxwriter
+isbnlib
