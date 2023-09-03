@@ -2,5 +2,5 @@ Pillow
 pytesseract
 pyzbar
 pandas
-xlsxwriter
+###xlsxwriter
 isbnlib
