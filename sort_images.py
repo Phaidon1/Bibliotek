@@ -43,7 +43,7 @@ if __name__ == "__main__":
     parser=argparse.ArgumentParser()
     parser.add_argument("-f","--folder",type=str,required=True,help="main folder with images")
     parser.add_argument("-o","--output",type=str,required=True,help="destination foler")
-    parser.parse_args()
-    folder = parser.folder
-    output = parser.output
+    args = parser.parse_args()
+    folder = args.folder
+    output = args.output
     create_subfolders_for_consecutive_pairs(folder,output)
