@@ -14,6 +14,11 @@ import pandas as pd
 from pandas import DataFrame
 
 from sort_images import IMAGE_EXTENSIONS
+from pillow_heif import register_heif_opener
+
+register_heif_opener()  # lets Image.open() read .heic/.heif
+
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".heic", ".heif")
 
 logger = logging.getLogger(__name__)
 
