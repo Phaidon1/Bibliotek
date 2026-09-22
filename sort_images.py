@@ -3,47 +3,62 @@ import shutil
 import logging
 import argparse
 
-def create_subfolders_for_consecutive_pairs(folder_path,output_folder)->list:
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def create_subfolders_for_consecutive_pairs(folder_path, output_folder) -> list:
     '''
     Sort images into subfolders.
     Two images per folder, with the assumption that for each book
     two pictures have been taken, one of the frontispice and one
     of the barcode or the isbn code.
+    Images are copied into `output_folder`, not into `folder_path`.
     Return list of subfolders absolute paths.
     '''
 
+    os.makedirs(output_folder, exist_ok=True)
+
     files = sorted(os.listdir(folder_path))
-    # Could it be that the issue with the previous iteration is that there were
-    # other files e.g. hidden system files?
-    # The line below filters only images.
-    files = [f for f in files if f.lower().endswith((".jpg",".jpeg",".png"))]
-    
+    # Filter to only image files, so hidden/system files don't throw off pairing.
+    files = [f for f in files if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+
+    if not files:
+        logger.warning("No images found in %s", folder_path)
+        return []
+
     subfolders = []
-    
-    for i in range(1, len(files), 2): #Why starting from 1 instead if 0?
+
+    # Start at 0 so the first image is included. Step by 2 to take consecutive pairs.
+    for i in range(0, len(files), 2):
         image1 = files[i]
-        if i+1 < len(files):
-            image2 = files[i + 1]
+        image2 = files[i + 1] if i + 1 < len(files) else None
 
-        else:
-            image2 = None
-
-        subfolder_name = f"Pair_{i//2 + 1}"
-        subfolder_path = os.path.join(folder_path, subfolder_name)
+        pair_number = i // 2 + 1
+        subfolder_name = f"Pair_{pair_number}"
+        subfolder_path = os.path.join(output_folder, subfolder_name)
         os.makedirs(subfolder_path, exist_ok=True)
 
         shutil.copy(os.path.join(folder_path, image1), os.path.join(subfolder_path, image1))
         if image2:
             shutil.copy(os.path.join(folder_path, image2), os.path.join(subfolder_path, image2))
-        subfolders.append(subfolder_path)
+        else:
+            logger.warning("Odd number of images: %s has no pair", image1)
 
-        return subfolders
-    
-if __name__ == "__main__": 
-    parser=argparse.ArgumentParser()
-    parser.add_argument("-f","--folder",type=str,required=True,help="main folder with images")
-    parser.add_argument("-o","--output",type=str,required=True,help="destination foler")
+        subfolders.append(subfolder_path)
+        logger.info("Created %s with %s", subfolder_path, [image1, image2] if image2 else [image1])
+
+    return subfolders
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-f", "--folder", type=str, required=True, help="main folder with images")
+    parser.add_argument("-o", "--output", type=str, required=True, help="destination folder")
     args = parser.parse_args()
+
     folder = args.folder
     output = args.output
-    create_subfolders_for_consecutive_pairs(folder,output)
+
+    result = create_subfolders_for_consecutive_pairs(folder, output)
+    logger.info("Created %d pair folders", len(result
