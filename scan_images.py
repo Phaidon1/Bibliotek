@@ -2,9 +2,8 @@ import os
 import re
 import shutil
 import logging
-import argparse
 from datetime import datetime
-from typing import List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pytesseract
@@ -14,17 +13,29 @@ from isbnlib import meta, notisbn, is_isbn10, is_isbn13
 import pandas as pd
 from pandas import DataFrame
 
-from sort_images import create_subfolders_for_consecutive_pairs
+from sort_images import IMAGE_EXTENSIONS
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+# --- Provenance -------------------------------------------------------------
 
-# Fixed column order for the catalogue. These are the keys isbnlib.meta() returns.
-# Using a fixed list means the spreadsheet always has headers, even on a run where
-# nothing scans, and the columns never reorder between runs.
-COLUMNS = ["Title", "Authors", "Year", "Publisher", "Language", "ISBN-13"]
+SOURCE_BARCODE = "Barcode"
+SOURCE_ISBN_OCR = "ISBN OCR"
+SOURCE_COVER_OCR = "Cover OCR"
+
+# Confidence levels:
+#   High   - barcode decoded. EAN-13 has its own check digit, so a misread is very rare.
+#   Medium - ISBN read by OCR on the first (greyscale) pass with no digit corrections.
+#   Low    - ISBN read by OCR only after binarising, or only after swapping look-alike
+#            letters for digits (O->0, l->1, ...). Checksum-valid, but worth a glance.
+# Cover OCR, once implemented, should map its fuzzy-match score onto these same labels.
+HIGH, MEDIUM, LOW = "High", "Medium", "Low"
+
+# Fixed column order for the catalogue. The first six are the keys isbnlib.meta()
+# returns; Source and Confidence are added by this script. Using a fixed list means
+# the spreadsheet always has headers, even on a run where nothing scans, and the
+# columns never reorder between runs.
+COLUMNS = ["Title", "Authors", "Year", "Publisher", "Language", "ISBN-13", "Source", "Confidence"]
 
 # --- ISBN-OCR configuration -------------------------------------------------
 
@@ -64,6 +75,9 @@ TESSERACT_CONFIG = "--psm 11"
 # phone photos (~4000 px) are left alone: upscaling them costs time for no gain.
 MIN_OCR_LONG_SIDE = 2500
 
+# Preprocessing variants, in the order they are tried. Must match ocr_variants().
+VARIANT_NAMES = ("greyscale", "binarised")
+
 
 def load_image(path: str) -> Image.Image:
     '''
@@ -96,9 +110,9 @@ def _otsu_threshold(gray: Image.Image) -> int:
 
 def ocr_variants(image: Image.Image):
     '''
-    Yield preprocessed versions of an image for OCR, cheapest/most likely first.
-    The caller stops as soon as one variant produces a valid ISBN, so the second
-    (binarised) pass only costs time on images where the first one failed.
+    Yield (name, image) preprocessed versions of an image for OCR, in the
+    order given by VARIANT_NAMES. Preprocessing is cheap; the expensive part
+    is the Tesseract call, which OcrCache only makes when a variant is asked for.
     '''
     gray = ImageOps.grayscale(image)
 
@@ -117,15 +131,76 @@ def ocr_variants(image: Image.Image):
     yield "binarised", gray.point(lambda p: 255 if p > threshold else 0)
 
 
+# --- OCR cache --------------------------------------------------------------
+
+def data_to_text(data: dict) -> str:
+    '''
+    Rebuild plain text from pytesseract.image_to_data() output: words joined
+    by spaces within a line, lines joined by newlines. Equivalent to what
+    image_to_string() returns, so the ISBN regexes behave the same.
+    '''
+    lines: Dict[tuple, List[str]] = {}
+    for i, word in enumerate(data["text"]):
+        if not word.strip():
+            continue
+        key = (data["page_num"][i], data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        lines.setdefault(key, []).append(word)
+    return "\n".join(" ".join(words) for words in lines.values())
+
+
+class OcrCache:
+    '''
+    OCR results for one book's images, computed at most once per
+    (image, variant) no matter how many strategies ask for them.
+
+    Stores image_to_data() output rather than plain text: words plus bounding
+    boxes and per-word confidence. The ISBN path reduces it to text; the cover
+    path (once implemented) needs the boxes to estimate font size and pick out
+    the title, so both can share one Tesseract call.
+    '''
+
+    def __init__(self, images: List[Image.Image]):
+        self.images = images
+        self._variants: Dict[int, Dict[str, Image.Image]] = {}
+        self._data: Dict[Tuple[int, str], dict] = {}
+
+    def variant(self, index: int, name: str) -> Image.Image:
+        if index not in self._variants:
+            self._variants[index] = dict(ocr_variants(self.images[index]))
+        return self._variants[index][name]
+
+    def data(self, index: int, name: str) -> dict:
+        key = (index, name)
+        if key not in self._data:
+            self._data[key] = pytesseract.image_to_data(
+                self.variant(index, name),
+                config=TESSERACT_CONFIG,
+                output_type=pytesseract.Output.DICT,
+            )
+        return self._data[key]
+
+    def text(self, index: int, name: str) -> str:
+        return data_to_text(self.data(index, name))
+
+
+# --- ISBN extraction from OCR text ------------------------------------------
+
 def _normalise_run(run: str) -> str:
     '''Apply OCR digit fixes to a numeric-looking run and strip separators.'''
     fixed = run.translate(OCR_DIGIT_FIXES)
     return re.sub(r"[^0-9X]", "", fixed)
 
 
-def extract_isbn_candidates(text: str) -> List[str]:
+def _literal_digits(run: str) -> str:
+    '''The run's digits exactly as OCR read them, with no look-alike fixes.'''
+    return re.sub(r"[^0-9X]", "", run.replace("x", "X"))
+
+
+def extract_isbn_candidates(text: str) -> List[Tuple[str, bool]]:
     '''
     Pull checksum-valid ISBN candidates out of raw OCR text, ISBN-13s first.
+    Returns (isbn, corrected) pairs, where corrected is True if the ISBN only
+    exists after swapping look-alike letters for digits.
 
     ISBN-13: any 13-digit window starting 978/979 inside a numeric run. Sliding
     windows handle runs where OCR glued extra digits on, e.g. the barcode's
@@ -135,17 +210,18 @@ def extract_isbn_candidates(text: str) -> List[str]:
     978/979 prefix, roughly 1 in 11 random 10-digit strings passes the checksum,
     and isbnlib would happily return metadata for the wrong book.
     '''
-    candidates = []
+    candidates: List[Tuple[str, bool]] = []
 
     for match in DIGIT_RUN.finditer(text):
         run = match.group()
         if sum(c.isdigit() for c in run) < MIN_REAL_DIGITS:
             continue
         digits = _normalise_run(run).replace("X", "")
+        literal = _literal_digits(run).replace("X", "")
         for i in range(len(digits) - 12):
             window = digits[i:i + 13]
             if window[:3] in ("978", "979") and is_isbn13(window):
-                candidates.append(window)
+                candidates.append((window, window not in literal))
 
     for label in ISBN_LABEL.finditer(text):
         match = DIGIT_RUN.match(text, label.end())
@@ -154,13 +230,19 @@ def extract_isbn_candidates(text: str) -> List[str]:
         digits = _normalise_run(match.group())
         window = digits[:10]
         if len(window) == 10 and is_isbn10(window):
-            candidates.append(window)
+            candidates.append((window, window not in _literal_digits(match.group())))
 
-    # De-duplicate while keeping order (ISBN-13s stay ahead of ISBN-10s).
-    return list(dict.fromkeys(candidates))
+    # De-duplicate while keeping order (ISBN-13s stay ahead of ISBN-10s). If the
+    # same ISBN was seen both with and without corrections, keep the clean reading.
+    best: Dict[str, bool] = {}
+    for isbn, corrected in candidates:
+        if isbn not in best or (best[isbn] and not corrected):
+            best[isbn] = corrected
+    return list(best.items())
 
 
 # --- Extraction strategies --------------------------------------------------
+# Each strategy returns isbnlib metadata plus "Source" and "Confidence", or {}.
 
 def data_from_barcode(images: List[Image.Image]) -> dict:
     '''
@@ -189,29 +271,32 @@ def data_from_barcode(images: List[Image.Image]) -> dict:
                 continue
 
             if isbn_data:
-                return isbn_data
+                return {**isbn_data, "Source": SOURCE_BARCODE, "Confidence": HIGH}
 
     return {}
 
 
-def data_from_isbn_ocr(images: List[Image.Image]) -> dict:
+def data_from_isbn_ocr(cache: OcrCache) -> dict:
     '''
-    OCR each image (orientation already corrected at load time) through a
-    sequence of preprocessing variants, extract ISBN-13/ISBN-10 candidates,
-    and look each up via isbnlib, same as the barcode path. Returns the first
-    successful lookup, or an empty dictionary if nothing is found.
+    OCR each image through the preprocessing variants, extract ISBN-13/ISBN-10
+    candidates, and look each up via isbnlib, same as the barcode path.
+    Returns the first successful lookup, or an empty dictionary.
+
+    Order is variant-first: the greyscale pass runs on every image before any
+    image is binarised. The front cover rarely carries an ISBN, so this avoids
+    a wasted binarised OCR of the cover when the back's greyscale pass succeeds.
     '''
     tried = set()
 
-    for image in images:
-        for variant_name, processed in ocr_variants(image):
+    for variant_name in VARIANT_NAMES:
+        for index in range(len(cache.images)):
             try:
-                text = pytesseract.image_to_string(processed, config=TESSERACT_CONFIG)
+                text = cache.text(index, variant_name)
             except Exception as e:
                 logger.warning("Failed to OCR image (%s) for ISBN text: %s", variant_name, e)
                 continue
 
-            for candidate in extract_isbn_candidates(text):
+            for candidate, corrected in extract_isbn_candidates(text):
                 if candidate in tried:
                     continue
                 tried.add(candidate)
@@ -223,18 +308,28 @@ def data_from_isbn_ocr(images: List[Image.Image]) -> dict:
                     continue
 
                 if isbn_data:
-                    logger.info("Recovered ISBN %s via OCR fallback (%s pass)", candidate, variant_name)
-                    return isbn_data
+                    confidence = MEDIUM if variant_name == "greyscale" and not corrected else LOW
+                    logger.info(
+                        "Recovered ISBN %s via OCR fallback (%s pass%s)",
+                        candidate, variant_name, ", digits corrected" if corrected else "",
+                    )
+                    return {**isbn_data, "Source": SOURCE_ISBN_OCR, "Confidence": confidence}
 
     return {}
 
 
-def data_from_cover_ocr(images: List[Image.Image]) -> dict:
+def data_from_cover_ocr(cache: OcrCache) -> dict:
     '''
     Fallback plan for when no ISBN can be found by barcode or OCR-of-ISBN-text.
-    Runs OCR across the whole cover and attempts to infer title/author from
-    the raw text (e.g. largest text block heuristics, or a lookup against a
-    books API by extracted title string).
+    Infers title/author from the cover's text and looks them up in a books API.
+
+    By the time this runs, data_from_isbn_ocr has already OCR'd every image, so
+    cache.data(index, "greyscale") returns Tesseract's words, bounding boxes
+    (left/top/width/height) and confidences without another OCR call. Box
+    height is the font-size proxy for picking out the title.
+
+    Should return Source=SOURCE_COVER_OCR and a Confidence derived from the
+    fuzzy-match score.
     '''
     # TODO: implement. This is the least reliable path and should be a last resort.
     return {}
@@ -244,7 +339,8 @@ def get_book_data(subfolder: str) -> dict:
     '''
     Load all images in a subfolder (assumed to be one book's pair of photos)
     and try each extraction strategy in order of reliability: barcode,
-    then OCR'd ISBN text, then full cover OCR.
+    then OCR'd ISBN text, then full cover OCR. The two OCR strategies share
+    one OcrCache so no image is OCR'd twice.
     '''
     image_paths = sorted(
         os.path.join(subfolder, f)
@@ -260,10 +356,13 @@ def get_book_data(subfolder: str) -> dict:
             logger.warning("Could not open image %s: %s", path, e)
 
     data = data_from_barcode(images)
+    if data:
+        return data
+
+    cache = OcrCache(images)
+    data = data_from_isbn_ocr(cache)
     if not data:
-        data = data_from_isbn_ocr(images)
-    if not data:
-        data = data_from_cover_ocr(images)
+        data = data_from_cover_ocr(cache)
 
     return data
 
@@ -274,7 +373,8 @@ def write_catalogue(df: DataFrame, output_path: str) -> str:
     '''
     Write the catalogue to .xlsx with a frozen header row, an autofilter on
     every column (so it can be sorted/filtered by Author, Year, etc. in one
-    click), and column widths sized to the content.
+    click), column widths sized to the content, and Low-confidence cells
+    highlighted so they stand out for a manual check.
 
     If the target file can't be written (typically because it is open in
     Excel on Windows, which locks it), the catalogue is saved to a
@@ -294,6 +394,13 @@ def write_catalogue(df: DataFrame, output_path: str) -> str:
                 longest = max([len(str(col))] + [len(str(v)) for v in df[col].dropna()])
                 sheet.set_column(col_idx, col_idx, min(longest + 2, 60))
 
+            if len(df) and "Confidence" in df.columns:
+                col_idx = df.columns.get_loc("Confidence")
+                low_fmt = writer.book.add_format({"bg_color": "#FFEB9C", "font_color": "#9C5700"})
+                sheet.conditional_format(1, col_idx, len(df), col_idx, {
+                    "type": "cell", "criteria": "==", "value": f'"{LOW}"', "format": low_fmt,
+                })
+
     try:
         _write(output_path)
         return output_path
@@ -308,7 +415,30 @@ def write_catalogue(df: DataFrame, output_path: str) -> str:
         return fallback
 
 
-def scan_all_folders(subfolders: list, not_scanned_folder: str, output_path: str):
+def list_pair_folders(folder: str) -> List[str]:
+    '''Return the immediate subfolders of folder (the Pair_N folders).'''
+    return [
+        os.path.join(folder, name)
+        for name in os.listdir(folder)
+        if os.path.isdir(os.path.join(folder, name))
+    ]
+
+
+def _unique_destination(folder: str, name: str) -> str:
+    '''
+    Return folder/name, or folder/name_2, name_3, ... if that already exists.
+    shutil.move() into an existing directory nests the source inside it rather
+    than failing, so a second run would otherwise bury Pair_3 inside the old Pair_3.
+    '''
+    dest = os.path.join(folder, name)
+    n = 2
+    while os.path.exists(dest):
+        dest = os.path.join(folder, f"{name}_{n}")
+        n += 1
+    return dest
+
+
+def scan_all_folders(subfolders: list, not_scanned_folder: str, output_path: str) -> Tuple[str, int, int]:
     '''
     Scan every subfolder for book metadata. Successfully identified books
     are collected into a single DataFrame and written out to an Excel
@@ -316,8 +446,12 @@ def scan_all_folders(subfolders: list, not_scanned_folder: str, output_path: str
     catalogue, listable by Author or Title). Subfolders where no data
     could be extracted are moved into not_scanned_folder for manual
     review.
+
+    Returns (path written, number identified, number not identified).
     '''
+    os.makedirs(not_scanned_folder, exist_ok=True)
     rows = []
+    unidentified = 0
 
     for subfolder in sorted(subfolders):
         try:
@@ -333,10 +467,14 @@ def scan_all_folders(subfolders: list, not_scanned_folder: str, output_path: str
             if isinstance(row.get("Authors"), list):
                 row["Authors"] = ", ".join(row["Authors"])
             rows.append(row)
-            logger.info("Scanned %s: %s", subfolder, row.get("Title", "unknown title"))
+            logger.info(
+                "Scanned %s: %s [%s, %s]", subfolder, row.get("Title", "unknown title"),
+                row.get("Source"), row.get("Confidence"),
+            )
         else:
-            logger.warning("Could not identify book in %s, moving to %s", subfolder, not_scanned_folder)
-            dest = os.path.join(not_scanned_folder, os.path.basename(subfolder))
+            unidentified += 1
+            dest = _unique_destination(not_scanned_folder, os.path.basename(subfolder))
+            logger.warning("Could not identify book in %s, moving to %s", subfolder, dest)
             try:
                 shutil.move(subfolder, dest)
             except Exception as e:
@@ -349,39 +487,5 @@ def scan_all_folders(subfolders: list, not_scanned_folder: str, output_path: str
         )
 
     written = write_catalogue(data_all_books, output_path)
-    logger.info("Wrote %d books to %s", len(rows), written)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-f", "--folder", type=str, required=True,
-        help="folder containing sorted Pair_N subfolders (output of sort_images.py)",
-    )
-    parser.add_argument(
-        "-n", "--not-scanned-folder", type=str, required=True,
-        help="destination folder for pairs that could not be identified",
-    )
-    parser.add_argument(
-        "-o", "--output", type=str, required=True,
-        help="output .xlsx catalogue file",
-    )
-    args = parser.parse_args()
-
-    sorted_folders = args.folder
-    not_scanned_folder = args.not_scanned_folder
-    output_path = args.output
-
-    if not output_path.lower().endswith(".xlsx"):
-        logger.warning("Output path %s does not end in .xlsx; appending extension", output_path)
-        output_path += ".xlsx"
-
-    subfolders = [
-        os.path.join(sorted_folders, subfolder)
-        for subfolder in os.listdir(sorted_folders)
-        if os.path.isdir(os.path.join(sorted_folders, subfolder))
-    ]
-
-    os.makedirs(not_scanned_folder, exist_ok=True)
-
-    scan_all_folders(subfolders, not_scanned_folder, output_path)
+    logger.info("Wrote %d books to %s (%d not identified)", len(rows), written, unidentified)
+    return written, len(rows), unidentified
