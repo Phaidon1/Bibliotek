@@ -1,6 +1,7 @@
 import os
 import shutil
 import logging
+from collections import Counter
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,15 @@ def create_subfolders_for_consecutive_pairs(folder_path, output_folder) -> list:
     if not files:
         logger.warning("No images found in %s", folder_path)
         return []
+
+    stems = Counter(os.path.splitext(f)[0].lower() for f in files)
+    dupes = sorted(s for s, n in stems.items() if n > 1)
+    if dupes:
+        logger.warning(
+            "Same photo saved in more than one format (%s%s). This offsets every "
+            "later pair; keep one format per photo.",
+            ", ".join(dupes[:5]), "…" if len(dupes) > 5 else "",
+        )
 
     if len(files) % 2:
         # An odd count usually means a photo is missing somewhere in the middle,
